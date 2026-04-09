@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:codes.ohio.gov)",
+      "Bash(node check-updates.js)",
+      "Bash(node -e ':*)"
+    ]
+  }
+}
