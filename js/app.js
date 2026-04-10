@@ -12,6 +12,8 @@
   // ── DOM refs ──
   const $ = (s) => document.querySelector(s);
   const ruleSelector = $('#ruleSelector');
+  const prevRuleBtn = $('#prevRule');
+  const nextRuleBtn = $('#nextRule');
   const sourceLink = $('#sourceLink');
   const themeToggle = $('#themeToggle');
   const searchInput = $('#searchInput');
@@ -50,18 +52,28 @@
   }
 
   // ── Rule Selector ──
+  const sortedRules = [...RULE_REGISTRY].sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: 'base' }));
+
   function populateRuleSelector() {
-    RULE_REGISTRY.forEach((r) => {
+    sortedRules.forEach((r) => {
       const opt = document.createElement('option');
       opt.value = r.id;
-      opt.textContent = `Rule ${r.id} — ${r.title}`;
+      opt.textContent = `${r.type === 'statute' ? 'ORC' : 'OAC'} ${r.id} — ${r.title}`;
       ruleSelector.appendChild(opt);
     });
+  }
+
+  function updateNavButtons(id) {
+    const idx = sortedRules.findIndex((r) => r.id === id);
+    prevRuleBtn.disabled = idx <= 0;
+    nextRuleBtn.disabled = idx >= sortedRules.length - 1;
   }
 
   function loadRule(id) {
     const entry = RULE_REGISTRY.find((r) => r.id === id);
     if (!entry) return;
+    ruleSelector.value = id;
+    updateNavButtons(id);
     currentRule = entry.getData();
     sourceLink.href = currentRule.sourceUrl;
     renderHeader();
@@ -675,6 +687,16 @@
     themeToggle.addEventListener('click', toggleTheme);
 
     ruleSelector.addEventListener('change', (e) => loadRule(e.target.value));
+
+    prevRuleBtn.addEventListener('click', () => {
+      const idx = sortedRules.findIndex((r) => r.id === ruleSelector.value);
+      if (idx > 0) loadRule(sortedRules[idx - 1].id);
+    });
+
+    nextRuleBtn.addEventListener('click', () => {
+      const idx = sortedRules.findIndex((r) => r.id === ruleSelector.value);
+      if (idx < sortedRules.length - 1) loadRule(sortedRules[idx + 1].id);
+    });
 
     // Search
     let debounceTimer;

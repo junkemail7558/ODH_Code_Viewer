@@ -8,6 +8,7 @@
  */
 
 const readline = require('readline');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
@@ -39,16 +40,24 @@ function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function ruleVarName(ruleId) {
-  return 'RULE_' + ruleId.replace(/-/g, '_');
+// ORC section IDs use dots (3749.01); OAC rule IDs use dashes (3701-31-06)
+function isORC(id) {
+  return /^\d+\.\d+/.test(id);
 }
 
-function ruleChapter(ruleId) {
-  return ruleId.split('-').slice(0, 2).join('-');
+function ruleVarName(id) {
+  if (isORC(id)) return 'ORC_' + id.replace(/[.\-]/g, '_');
+  return 'RULE_' + id.replace(/-/g, '_');
 }
 
-function ruleSourceUrl(ruleId) {
-  return `https://codes.ohio.gov/ohio-administrative-code/rule-${ruleId}`;
+function ruleChapter(id) {
+  if (isORC(id)) return id.split('.')[0];          // "3749.01" → "3749"
+  return id.split('-').slice(0, 2).join('-');       // "3701-31-06" → "3701-31"
+}
+
+function ruleSourceUrl(id) {
+  if (isORC(id)) return `https://codes.ohio.gov/ohio-revised-code/section-${id}`;
+  return `https://codes.ohio.gov/ohio-administrative-code/rule-${id}`;
 }
 
 /**
@@ -203,7 +212,7 @@ function countSections(sections) {
 const META_SPLIT_RE = /(?=Five.?Year|Promulgated\s+Under|Authorized\s+By|Amplifies:|Prior\s+Effective)/gi;
 
 // Lines to suppress from preamble (web chrome / navigation clutter)
-const NOISE_RE = /^(ohio administrative code|search|print|pdf|share|bookmark|home|back|next|previous|lawriter|https?:\/\/|\d{4}\s*[\/|])/i;
+const NOISE_RE = /^(ohio (administrative|revised) code|search|print|pdf|share|bookmark|home|back\s+to|skip\s+to|next|previous|download|lawriter|https?:\/\/|\d{4}\s*[\/|]|latest legislation|available versions|title \d+|legislative service|updates may be|house bill|senate bill|\[\s*view|section \d.*ohio)/i;
 
 /**
  * Parse raw copy-pasted rule text into metadata + sections.
@@ -227,30 +236,44 @@ function parseRuleText(ruleId, rawText) {
     preamble: ''
   };
 
+  // OAC: "3701-31-03 Some Title."   ORC: "Section 3749.02 | Some Title."
   const titleRe = new RegExp(`^${escapeRe(ruleId)}\\s+(.+?)\\s*\\.?$`, 'i');
+  const orcTitleRe = new RegExp(`^Section\\s+${escapeRe(ruleId)}\\s*[|]\\s*(.+?)\\s*\\.?$`, 'i');
   const preambleLines = [];
   let sectionStartIdx = -1;
 
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i];
 
-    // Rule title: "3701-31-03 Some Title."
+    // Rule title: OAC "3701-31-03 Some Title." or ORC "Section 3749.02 | Some Title."
     if (!meta.title) {
-      const m = line.match(titleRe);
+      const m = line.match(titleRe) || line.match(orcTitleRe);
       if (m) { meta.title = m[1].replace(/\.$/, '').trim(); continue; }
     }
 
-    // Chapter title: "Chapter 3701-31 | Public Swimming Pools or Spas"
+    // Chapter title: "Chapter 3701-31 | Title" or "Chapter 3749 Swimming Pools"
     if (!meta.chapterTitle) {
-      const m = line.match(/^Chapter\s+[\d-]+\s*[|:]\s*(.+)$/i);
+      const m = line.match(/^Chapter\s+[\d.-]+\s*(?:[|:]\s*|\s+)(.+)$/i);
       if (m) { meta.chapterTitle = m[1].trim(); continue; }
     }
 
-    // Effective date
-    {
+    // Effective date — same line: "Effective: July 25, 2024"
+    //                — next line: "Effective:\n" then "September 10, 2012"
+    if (!meta.effectiveDate) {
       const m = line.match(/^Effective\s*:\s*(.+)$/i) || line.match(/^Effective\s+(\d.+)$/i);
       if (m) { meta.effectiveDate = parseDate(m[1]); continue; }
+      if (/^Effective\s*:?\s*$/i.test(line) && i + 1 < rawLines.length) {
+        const candidate = parseDate(rawLines[i + 1]);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(candidate)) {
+          meta.effectiveDate = candidate;
+          i++;
+          continue;
+        }
+      }
     }
+
+    // Latest Legislation (ORC) — skip label + value line
+    if (/^Latest\s+Legislation\s*:?\s*$/i.test(line)) { i++; continue; }
 
     // Five Year Review date
     {
@@ -338,42 +361,75 @@ function generateRuleJs(ruleId, meta, sections) {
   const varName = ruleVarName(ruleId);
   const chapter = ruleChapter(ruleId);
   const sourceUrl = ruleSourceUrl(ruleId);
+  const orc = isORC(ruleId);
 
   const sectionsJs = sections.length === 0
     ? '[]'
     : `[\n${sections.map(s => sectionToJs(s, 4)).join(',\n')}\n  ]`;
 
+  const header = orc
+    ? `// Ohio Revised Code Section ${ruleId}\n`
+    : `// Ohio Administrative Code Rule ${ruleId}\n`;
+
+  const oacFields = orc ? '' : (
+    `  fiveYearReview: ${jsStr(meta.fiveYearReview)},\n` +
+    `  promulgatedUnder: ${jsStr(meta.promulgatedUnder)},\n` +
+    `  authorizedBy: ${jsStr(meta.authorizedBy)},\n` +
+    `  amplifies: ${jsStr(meta.amplifies)},\n` +
+    `  priorEffectiveDates: ${jsStr(meta.priorEffectiveDates)},\n`
+  );
+
   return (
-    `// Ohio Administrative Code Rule ${ruleId}\n` +
+    `${header}` +
     `// ${meta.title || '(title not detected)'}\n` +
     `// Effective: ${meta.effectiveDate || '(unknown)'}\n` +
     `// Source: ${sourceUrl}\n` +
     `\n` +
     `const ${varName} = {\n` +
     `  id: ${jsStr(ruleId)},\n` +
+    `  type: ${jsStr(orc ? 'statute' : 'rule')},\n` +
     `  title: ${jsStr(meta.title)},\n` +
     `  chapter: ${jsStr(chapter)},\n` +
     `  chapterTitle: ${jsStr(meta.chapterTitle)},\n` +
     `  effectiveDate: ${jsStr(meta.effectiveDate)},\n` +
-    `  fiveYearReview: ${jsStr(meta.fiveYearReview)},\n` +
     `  sourceUrl: ${jsStr(sourceUrl)},\n` +
-    `  promulgatedUnder: ${jsStr(meta.promulgatedUnder)},\n` +
-    `  authorizedBy: ${jsStr(meta.authorizedBy)},\n` +
-    `  amplifies: ${jsStr(meta.amplifies)},\n` +
-    `  priorEffectiveDates: ${jsStr(meta.priorEffectiveDates)},\n` +
+    `${oacFields}` +
     `  preamble: ${jsStr(meta.preamble)},\n` +
     `  sections: ${sectionsJs}\n` +
     `};\n`
   );
 }
 
+// ─── INDEX.HTML UPDATER ──────────────────────────────────────────────────────
+
+function updateHtml(htmlPath, ruleId) {
+  if (!fs.existsSync(htmlPath)) return;
+
+  let content = fs.readFileSync(htmlPath, 'utf8');
+  const scriptTag = `  <script src="js/rules/${ruleId}.js"></script>`;
+
+  // Already present → nothing to do
+  if (content.includes(`js/rules/${ruleId}.js`)) return;
+
+  // Insert before the app.js script tag
+  const appScriptTag = '  <script src="js/app.js"></script>';
+  if (!content.includes(appScriptTag)) {
+    throw new Error('Cannot find app.js script tag in index.html');
+  }
+
+  content = content.replace(appScriptTag, `${scriptTag}\n${appScriptTag}`);
+  fs.writeFileSync(htmlPath, content, 'utf8');
+}
+
 // ─── INDEX.JS UPDATER ────────────────────────────────────────────────────────
 
 function updateIndex(indexPath, ruleId, meta) {
   const varName = ruleVarName(ruleId);
+  const type = isORC(ruleId) ? 'statute' : 'rule';
   const newEntry =
     `  {\n` +
     `    id: ${jsStr(ruleId)},\n` +
+    `    type: ${jsStr(type)},\n` +
     `    title: ${jsStr(meta.title)},\n` +
     `    getData: () => ${varName}\n` +
     `  }`;
@@ -424,45 +480,114 @@ function updateIndex(indexPath, ruleId, meta) {
   fs.writeFileSync(indexPath, newContent, 'utf8');
 }
 
+// ─── FETCH + HTML→TEXT ───────────────────────────────────────────────────────
+
+function fetchHtml(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'ODH-Rule-Scraper/1.0' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchHtml(res.headers.location).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+      }
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => resolve(body));
+    }).on('error', reject);
+  });
+}
+
+function htmlToText(html) {
+  // Remove entire script/style/nav/header/footer blocks
+  html = html.replace(/<(script|style|nav|header|footer|noscript)[^>]*>[\s\S]*?<\/\1>/gi, '');
+
+  // Block-level elements → newlines so lines stay separate
+  html = html.replace(/<\/?(p|div|li|br|h[1-6]|section|article|tr|td|th)[^>]*>/gi, '\n');
+
+  // Strip remaining tags
+  html = html.replace(/<[^>]+>/g, '');
+
+  // Decode common HTML entities
+  html = html
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&mdash;/g, '—')
+    .replace(/&ndash;/g, '–')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+
+  // Collapse whitespace within lines, drop blank lines
+  return html
+    .split('\n')
+    .map(l => l.replace(/\s+/g, ' ').trim())
+    .filter(l => l.length > 0)
+    .join('\n');
+}
+
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const args = process.argv.slice(2);
+  const pasteMode = args.includes('--paste');
+  const debugMode = args.includes('--debug');
 
   console.log('\nODH Rule Scraper');
   console.log('─'.repeat(36));
 
-  // Step 1: get rule ID
-  const ruleId = await new Promise(resolve =>
-    rl.question('Rule ID (e.g. 3701-31-03): ', answer => resolve(answer.trim()))
-  );
+  // Step 1: get rule ID — from CLI arg or prompt
+  let ruleId = args.find(a => !a.startsWith('--'));
 
-  if (!ruleId || !/^\d{4}-\d{2,3}-\d{2,3}[a-z]?$/.test(ruleId)) {
-    console.error(`\n✗ Invalid rule ID format: "${ruleId}"`);
-    console.error('  Expected format: XXXX-XX-XX  (e.g. 3701-31-03)');
-    rl.close();
+  if (!ruleId) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    ruleId = await new Promise(resolve =>
+      rl.question('Rule ID (e.g. 3701-31-03): ', answer => { rl.close(); resolve(answer.trim()); })
+    );
+  }
+
+  const validOAC = /^\d{4}-\d{2,3}-\d{2,3}[a-z]?$/.test(ruleId);
+  const validORC = /^\d+\.\d+[A-Za-z]?$/.test(ruleId);
+  if (!ruleId || (!validOAC && !validORC)) {
+    console.error(`\n✗ Invalid ID format: "${ruleId}"`);
+    console.error('  OAC rule:    XXXX-XX-XX   (e.g. 3701-31-03)');
+    console.error('  ORC section: XXXX.XX      (e.g. 3749.01)');
     process.exit(1);
   }
 
-  // Step 2: collect pasted text until Ctrl+D (EOF)
-  console.log('\nPaste the full rule text, then press Ctrl+D when done:\n');
+  // Step 2: get raw text — fetch automatically, or paste manually with --paste
+  let rawText;
 
-  const textLines = [];
-  rl.on('line', line => textLines.push(line));
-
-  await new Promise(resolve => rl.once('close', resolve));
-
-  const rawText = textLines.join('\n');
-
-  if (!rawText.trim()) {
-    console.error('\n✗ No text was pasted.');
-    process.exit(1);
+  if (pasteMode) {
+    console.log('\nPaste the full rule text, then press Ctrl+D when done:\n');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const textLines = [];
+    rl.on('line', line => textLines.push(line));
+    await new Promise(resolve => rl.once('close', resolve));
+    rawText = textLines.join('\n');
+    if (!rawText.trim()) {
+      console.error('\n✗ No text was pasted.');
+      process.exit(1);
+    }
+  } else {
+    const url = ruleSourceUrl(ruleId);
+    process.stdout.write(`\nFetching ${url} ... `);
+    const html = await fetchHtml(url);
+    rawText = htmlToText(html);
+    console.log('done');
+    if (debugMode) {
+      console.log('\n── Extracted text (first 60 lines) ──');
+      rawText.split('\n').slice(0, 60).forEach((l, i) => console.log(`${String(i+1).padStart(3)}: ${l}`));
+      console.log('─'.repeat(40));
+    }
   }
 
   // Step 3: parse
   const { meta, sections, sectionCount } = parseRuleText(ruleId, rawText);
-
-  console.log(`\n✓ Parsing complete — ${sectionCount} sections found`);
+  console.log(`✓ Parsed — ${sectionCount} sections found`);
 
   // Step 4: determine output paths (relative to this script's directory)
   const scriptDir = path.dirname(path.resolve(process.argv[1]));
@@ -475,22 +600,36 @@ async function main() {
   const ruleFile = path.join(rulesDir, `${ruleId}.js`);
   const indexFile = path.join(rulesDir, 'index.js');
 
-  // Step 5: write rule file
+  // Step 5: write rule file — abort only if truly nothing was captured.
+  // Note: ORC sections are often plain prose with no labeled paragraphs, so
+  // sectionCount === 0 is valid for statutes. Only abort when there is no
+  // title AND no preamble text either.
+  const hasContent = meta.title || sectionCount > 0 || meta.preamble.length > 30;
+  if (!hasContent && !pasteMode) {
+    console.error(`\n✗ No content found for ${ruleId} — it may not exist or the page structure changed.`);
+    console.error(`  Try: node scrape-rule.js ${ruleId} --paste`);
+    console.error('  No file was written.');
+    process.exit(1);
+  }
+
   const ruleJs = generateRuleJs(ruleId, meta, sections);
   fs.writeFileSync(ruleFile, ruleJs, 'utf8');
   console.log(`✓ Written: js/rules/${ruleId}.js`);
 
-  // Step 6: update index
+  // Step 6: update index and html
   updateIndex(indexFile, ruleId, meta);
   console.log(`✓ Updated: js/rules/index.js`);
+
+  const htmlFile = path.join(scriptDir, 'index.html');
+  updateHtml(htmlFile, ruleId);
+  console.log(`✓ Updated: index.html`);
 
   // Step 7: summary hints
   if (!meta.title) {
     console.log('\n  Note: rule title not detected — edit the "title" field in the output file.');
   }
-  if (sectionCount === 0) {
-    console.log('\n  Warning: no labeled sections found. Check that the pasted text includes');
-    console.log('  paragraphs beginning with (A), (B), (1), (a), etc.');
+  if (sectionCount === 0 && !isORC(ruleId)) {
+    console.log('\n  Warning: no labeled sections found. Check the output file.');
   }
 }
 
